@@ -221,6 +221,7 @@ func createTestSrv(t *testing.T) (*testSrv, *grpc.ClientConn, error) {
 }
 
 func TestGetEndpoint(t *testing.T) {
+	metadataInited = false
 	if err := metadataInit(); err != nil {
 		t.Fatalf("metadataInit() failed: %v", err)
 	}
