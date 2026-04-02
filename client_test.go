@@ -475,6 +475,66 @@ func TestNewConnectionErrors(t *testing.T) {
 	}
 }
 
+func TestNewConnection_ExceededRetries(t *testing.T) {
+	oldMaxResource := maxResourceExhaustedRetries
+	oldMaxUnavailable := maxUnavailableRetries
+	oldSleep := timeSleep
+	maxResourceExhaustedRetries = 2
+	maxUnavailableRetries = 2
+	timeSleep = func(d time.Duration) {}
+
+	// Restore the old values after the test is done.
+	defer func() {
+		maxResourceExhaustedRetries = oldMaxResource
+		maxUnavailableRetries = oldMaxUnavailable
+		timeSleep = oldSleep
+	}()
+
+	tests := []struct {
+		name string
+		code codes.Code
+	}{
+		{
+			name: "ResourceExhausted",
+			code: codes.ResourceExhausted,
+		},
+		{
+			name: "Unavailable",
+			code: codes.Unavailable,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			srv, cc, err := createTestSrv(t)
+			if err != nil {
+				t.Fatalf("createTestSrv() failed: %v", err)
+			}
+
+			// Push 4 errors (initial + 2 retries + 1 that should fail).
+			go func() {
+				for i := 0; i < 4; i++ {
+					srv.recvErr <- status.Error(tc.code, tc.name)
+				}
+			}()
+
+			client, err := NewClient(ctx, false, option.WithGRPCConn(cc))
+			if err != nil {
+				t.Fatalf("NewClient() failed: %v", err)
+			}
+
+			_, err = NewConnection(ctx, testChannelID, client)
+			if err == nil {
+				t.Fatal("NewConnection() expected to fail due to exceeded retries")
+			}
+			if !strings.Contains(err.Error(), tc.name) {
+				t.Errorf("Unexpected error message: %v", err)
+			}
+		})
+	}
+}
+
 func TestSendMessage(t *testing.T) {
 	ctx := context.Background()
 	srv, conn, err := newTestConnection(ctx, t)

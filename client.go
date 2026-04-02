@@ -70,6 +70,10 @@ var (
 	}
 
 	logger *log.Logger
+
+	maxResourceExhaustedRetries = 20
+	maxUnavailableRetries       = 5
+	timeSleep                   = time.Sleep
 )
 
 // ErrUnsupportedUniverse is an error indicating that ACS is not supported in
@@ -298,7 +302,7 @@ func (c *Connection) SendMessage(msg *acpb.MessageBody) error {
 		err := c.sendMessage(msg)
 		if errors.Is(err, ErrResourceExhausted) {
 			// Start with 250ms sleep, then simply multiply by iteration.
-			time.Sleep(time.Duration(i*250) * time.Millisecond)
+			timeSleep(time.Duration(i*250) * time.Millisecond)
 			continue
 		} else if errors.Is(err, ErrMessageTimeout) {
 			continue
@@ -523,23 +527,22 @@ func createStreamLoop(ctx context.Context, client *agentcommunication.Client, re
 
 		st, ok := status.FromError(err)
 		if ok && st.Code() == codes.ResourceExhausted {
-			loggerPrintf("Resource exhausted, sleeping before reconnect: %v", err)
-			if resourceExhaustedRetries > 20 {
-				loggerPrintf("Stream returned ResourceExhausted, exceeded max number of reconnects, closing connection: %v", err)
+			if resourceExhaustedRetries <= maxResourceExhaustedRetries {
+				loggerPrintf("Resource exhausted, sleeping before reconnect: %v", err)
+				sleep := time.Duration(resourceExhaustedRetries+1) * time.Second
+				if resourceExhaustedRetries > 9 {
+					sleep = 10 * time.Second
+				}
+				timeSleep(sleep)
+				resourceExhaustedRetries++
+				continue
 			}
-			sleep := time.Duration(resourceExhaustedRetries+1) * time.Second
-			if resourceExhaustedRetries > 9 {
-				sleep = 10 * time.Second
-			}
-			time.Sleep(sleep)
-			resourceExhaustedRetries++
-			continue
+			loggerPrintf("Stream returned ResourceExhausted, exceeded max number of reconnects, closing connection: %v", err)
 		} else if ok && st.Code() == codes.Unavailable {
-			// Retry max 5 times (2s total).
-			if unavailableRetries <= 5 {
+			if unavailableRetries <= maxUnavailableRetries {
 				loggerPrintf("Stream returned Unavailable, will reconnect: %v", err)
 				// Sleep for 200ms * num of unavailableRetries, first retry is immediate.
-				time.Sleep(time.Duration(unavailableRetries*200) * time.Millisecond)
+				timeSleep(time.Duration(unavailableRetries*200) * time.Millisecond)
 				unavailableRetries++
 				continue
 			}
