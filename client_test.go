@@ -42,6 +42,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 	"google.golang.org/protobuf/testing/protocmp"
+	"github.com/mdlayher/vsock"
 
 	apb "google.golang.org/protobuf/types/known/anypb"
 	acpb "github.com/GoogleCloudPlatform/agentcommunication_client/gapic/agentcommunicationpb"
@@ -190,6 +191,7 @@ func (s *testSrv) SendAgentMessage(ctx context.Context, req *acpb.SendAgentMessa
 }
 
 func createTestSrv(t *testing.T) (*testSrv, *grpc.ClientConn, error) {
+	t.Helper()
 	lis := bufconn.Listen(bufSize)
 	s := grpc.NewServer()
 	t.Cleanup(func() {
@@ -202,7 +204,7 @@ func createTestSrv(t *testing.T) (*testSrv, *grpc.ClientConn, error) {
 	go func() {
 		close(started)
 		if err := s.Serve(lis); err != nil {
-			log.Fatalf("Server exited with error: %v", err)
+			t.Errorf("Server exited with error: %v", err)
 		}
 	}()
 	// Give goroutine enough time to start
@@ -218,6 +220,45 @@ func createTestSrv(t *testing.T) (*testSrv, *grpc.ClientConn, error) {
 	}
 
 	return srv, cc, nil
+}
+
+func createTestSrvVSOCK(t *testing.T) (*testSrv, error) {
+	t.Helper()
+	DefaultAllowVSOCK = true
+	vsockAvailable = func() bool { return true }
+	vsockTarget = fmt.Sprintf("passthrough:%d:%d", vsock.Local, vsockPort)
+	t.Cleanup(func() {
+		DefaultAllowVSOCK = false
+	})
+
+	lis, err := vsock.ListenContextID(vsock.Local, vsockPort, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to dial vsock: %w", err)
+	}
+	t.Cleanup(func() {
+		if err := lis.Close(); err != nil {
+			t.Errorf("failed to close vsock: %v", err)
+		}
+	})
+
+	s := grpc.NewServer()
+	t.Cleanup(func() {
+		s.GracefulStop()
+	})
+	srv := newTestSrv(s)
+	acpb.RegisterAgentCommunicationServer(s, srv)
+
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		if err := s.Serve(lis); err != nil {
+			t.Errorf("Server exited with error: %v", err)
+		}
+	}()
+	// Give goroutine enough time to start
+	<-started
+
+	return srv, nil
 }
 
 func TestGetEndpoint(t *testing.T) {
@@ -265,7 +306,7 @@ func TestSendAgentMessage(t *testing.T) {
 
 	client, err := NewClient(ctx, false, option.WithGRPCConn(cc))
 	if err != nil {
-		log.Fatal(err)
+		t.Fatalf("NewClient() failed: %v", err)
 	}
 
 	msg := &acpb.MessageBody{Labels: map[string]string{"key": "value"}, Body: &apb.Any{Value: []byte("test-body")}}
@@ -283,7 +324,36 @@ func TestSendAgentMessage(t *testing.T) {
 		Body:   msg.GetBody(),
 	}}
 	if diff := cmp.Diff(want, got, protocmp.Transform()); diff != "" {
-		t.Errorf("SendAgentMessage returned an unexpected diff (-want +got): %v", diff)
+		t.Errorf("SendAgentMessage returned an unexpected diff (-want +got):\n%v", diff)
+	}
+}
+
+func TestSendAgentMessage_VSOCK(t *testing.T) {
+	ctx := context.Background()
+	_, err := createTestSrvVSOCK(t)
+	if err != nil {
+		t.Fatalf("createTestCC() failed: %v", err)
+	}
+
+	client, err := NewClient(ctx, false)
+	if err != nil {
+		t.Fatalf("NewClient() failed: %v", err)
+	}
+
+	msg := &acpb.MessageBody{Labels: map[string]string{"key": "value"}, Body: &apb.Any{Value: []byte("test-body")}}
+	got, err := SendAgentMessage(ctx, testChannelID, client, msg)
+	if err != nil {
+		t.Fatalf("SendAgentMessage returned an unexpected error: %v", err)
+	}
+
+	labels := msg.GetLabels()
+	labels["agent-communication-channel-id"] = testChannelID
+	want := &acpb.SendAgentMessageResponse{MessageBody: &acpb.MessageBody{
+		Labels: labels,
+		Body:   msg.GetBody(),
+	}}
+	if diff := cmp.Diff(want, got, protocmp.Transform()); diff != "" {
+		t.Errorf("SendAgentMessage returned an unexpected diff (-want +got):\n%v", diff)
 	}
 }
 
@@ -316,7 +386,7 @@ func TestMetadataInit(t *testing.T) {
 
 	client, err := NewClient(ctx, false, option.WithGRPCConn(cc))
 	if err != nil {
-		log.Fatal(err)
+		t.Fatalf("NewClient() failed: %v", err)
 	}
 
 	msg := &acpb.MessageBody{Labels: map[string]string{"key": "value"}, Body: &apb.Any{Value: []byte("test-body")}}
@@ -334,7 +404,7 @@ func TestMetadataInit(t *testing.T) {
 		Body:   msg.GetBody(),
 	}}
 	if diff := cmp.Diff(want, got, protocmp.Transform()); diff != "" {
-		t.Errorf("SendAgentMessage returned an unexpected diff (-want +got): %v", diff)
+		t.Errorf("SendAgentMessage returned an unexpected diff (-want +got):\n%v", diff)
 	}
 	ep, err := getEndpoint(false)
 	if err != nil {
@@ -475,6 +545,62 @@ func TestNewConnectionErrors(t *testing.T) {
 	}
 }
 
+func newTestConnectionVSOCK(ctx context.Context, t *testing.T) (*testSrv, *Connection, error) {
+	t.Helper()
+	srv, err := createTestSrvVSOCK(t)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	client, err := NewClient(ctx, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	conn, err := NewConnection(ctx, testChannelID, client)
+	if err != nil {
+		return nil, nil, err
+	}
+	t.Cleanup(func() {
+		conn.Close()
+	})
+	return srv, conn, nil
+}
+
+func TestNewConnection_VSOCK(t *testing.T) {
+	ctx := context.Background()
+
+	srv, conn, err := newTestConnectionVSOCK(ctx, t)
+	if err != nil {
+		t.Fatalf("newTestConnectionVSOCK() failed: %v", err)
+	}
+
+	if len(srv.req) != 1 {
+		t.Fatalf("srv.req = %v, want 1", len(srv.req))
+	}
+
+	wantReq := &acpb.StreamAgentMessagesRequest{Type: &acpb.StreamAgentMessagesRequest_RegisterConnection{RegisterConnection: &acpb.RegisterConnection{ChannelId: testChannelID}}}
+	if diff := cmp.Diff(srv.req[0], wantReq, protocmp.Transform(), cmpopts.IgnoreUnexported(), protocmp.IgnoreFields(&acpb.StreamAgentMessagesRequest{}, "message_id")); diff != "" {
+		t.Fatalf("srv.req[0] diff (-want +got):\n%s", diff)
+	}
+
+	// VSOCK doesn't send authentication or resource ID headers.
+	wantHeaders := map[string][]string{
+		"agent-communication-channel-id": {"test-channel"},
+	}
+	for k, v := range wantHeaders {
+		if !reflect.DeepEqual(srv.headers.Get(k), v) {
+			t.Errorf("srv.headers[%s] = %v, want %v", k, srv.headers[k], v)
+		}
+	}
+
+	if conn.MessageBandwidthLimit() != metadataBandwidthLimitValue {
+		t.Errorf("conn.MessageBandwidthLimit() = %v, want %v", conn.MessageBandwidthLimit(), metadataBandwidthLimitValue)
+	}
+	if conn.MessageRateLimit() != metadataMessageRateLimitValue {
+		t.Errorf("conn.MessageRateLimit() = %v, want %v", conn.MessageRateLimit(), metadataMessageRateLimitValue)
+	}
+}
+
 func TestNewConnection_ExceededRetries(t *testing.T) {
 	oldMaxResource := maxResourceExhaustedRetries
 	oldMaxUnavailable := maxUnavailableRetries
@@ -534,12 +660,35 @@ func TestNewConnection_ExceededRetries(t *testing.T) {
 		})
 	}
 }
-
 func TestSendMessage(t *testing.T) {
 	ctx := context.Background()
 	srv, conn, err := newTestConnection(ctx, t)
 	if err != nil {
 		t.Fatalf("newTestConnection() failed: %v", err)
+	}
+
+	msg := &acpb.MessageBody{Labels: map[string]string{"key": "value"}, Body: &apb.Any{Value: []byte("test-body")}}
+	if err := conn.SendMessage(msg); err != nil {
+		t.Fatalf("SendMessage() failed: %v", err)
+	}
+	time.Sleep(5 * time.Millisecond)
+
+	if len(srv.req) != 2 {
+		t.Fatalf("srv.req = %v, want 2", len(srv.req))
+	}
+
+	wantReq := &acpb.StreamAgentMessagesRequest{Type: &acpb.StreamAgentMessagesRequest_MessageBody{MessageBody: msg}}
+	if diff := cmp.Diff(srv.req[1], wantReq, protocmp.Transform(), cmpopts.IgnoreUnexported(), protocmp.IgnoreFields(&acpb.StreamAgentMessagesRequest{}, "message_id")); diff != "" {
+		t.Errorf("srv.req[1] diff (-want +got):\n%s", diff)
+	}
+}
+
+func TestSendMessage_VSOCK(t *testing.T) {
+	ctx := context.Background()
+
+	srv, conn, err := newTestConnectionVSOCK(ctx, t)
+	if err != nil {
+		t.Fatalf("newTestConnectionVSOCK() failed: %v", err)
 	}
 
 	msg := &acpb.MessageBody{Labels: map[string]string{"key": "value"}, Body: &apb.Any{Value: []byte("test-body")}}
@@ -673,7 +822,7 @@ func TestClose(t *testing.T) {
 
 	go func() {
 		if err := s.Serve(lis); err != nil {
-			log.Fatalf("Server exited with error: %v", err)
+			t.Errorf("Server exited with error: %v", err)
 		}
 	}()
 

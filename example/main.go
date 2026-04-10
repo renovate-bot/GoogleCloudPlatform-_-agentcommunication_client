@@ -36,9 +36,10 @@ var (
 func main() {
 	flag.Parse()
 	ctx := context.Background()
+	client.DefaultAllowVSOCK = true
 	client.DebugLogging = true
 
-	opts := []option.ClientOption{}
+	var opts []option.ClientOption
 	if *endpoint != "" {
 		opts = append(opts, option.WithEndpoint(*endpoint))
 	}

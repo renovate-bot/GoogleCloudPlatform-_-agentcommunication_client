@@ -116,6 +116,13 @@ func getEndpoint(regional bool) (string, error) {
 // Caller must close the returned client when it is done being used to clean up its underlying
 // connections.
 func NewClient(ctx context.Context, regional bool, opts ...option.ClientOption) (*agentcommunication.Client, error) {
+	// Using VSOCK requires the vsockAvailable function to return true, it checks if VSOCK is
+	// available on the system and if DefaultAllowVSOCK is set to true.
+	// VSOCK connections do not require metadata initialization.
+	if vsockAvailable() {
+		return newVSOCKClient(ctx, vsockPort, opts...)
+	}
+
 	if err := metadataInit(); err != nil {
 		return nil, err
 	}
@@ -125,30 +132,45 @@ func NewClient(ctx context.Context, regional bool, opts ...option.ClientOption) 
 		return nil, err
 	}
 	optsWithEndpoint := append(defaultOpts, option.WithEndpoint(endpoint))
-	return agentcommunication.NewClient(ctx, append(optsWithEndpoint, opts...)...)
+	client, err := agentcommunication.NewClient(ctx, append(optsWithEndpoint, opts...)...)
+	if err != nil {
+		return nil, err
+	}
+	loggerPrintf("Dialed Target: %q", client.Connection().Target())
+	return client, nil
 }
 
 // SendAgentMessage sends a message to the client. This is equivalent to sending a message via
 // StreamAgentMessages with a single message and waiting for the response.
 func SendAgentMessage(ctx context.Context, channelID string, client *agentcommunication.Client, msg *acpb.MessageBody) (*acpb.SendAgentMessageResponse, error) {
+	loggerPrintf("SendAgentMessage")
+
+	md := metadata.New(map[string]string{
+		"agent-communication-channel-id": channelID,
+	})
+
+	loggerPrintf("Using ChannelID %q", channelID)
+	ctx = metadata.NewOutgoingContext(ctx, md)
+
+	// VSOCK connections do not require metadata initialization, resource ID is set by the proxy.
+	if clientUsingVSOCK(client) {
+		loggerPrintf("Using VSOCK connection.")
+		return client.SendAgentMessage(ctx, &acpb.SendAgentMessageRequest{
+			ChannelId:   channelID,
+			MessageBody: msg,
+		})
+	}
+
 	if err := metadataInit(); err != nil {
 		return nil, err
 	}
-
-	loggerPrintf("SendAgentMessage")
 	token, err := getIdentityToken()
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrGettingInstanceToken, err)
 	}
-
-	ctx = metadata.NewOutgoingContext(ctx, metadata.New(map[string]string{
-		"authentication":                  "Bearer " + token,
-		"agent-communication-resource-id": getResourceID(),
-		"agent-communication-channel-id":  channelID,
-	}))
-
+	md.Set("authentication", "Bearer "+token)
+	md.Set("agent-communication-resource-id", getResourceID())
 	loggerPrintf("Using ResourceID %q", getResourceID())
-	loggerPrintf("Using ChannelID %q", channelID)
 
 	return client.SendAgentMessage(ctx, &acpb.SendAgentMessageRequest{
 		ChannelId:   channelID,
@@ -178,6 +200,7 @@ type Connection struct {
 
 	regional          bool
 	timeToWaitForResp time.Duration
+	usingVSOCK        bool
 
 	limitsMx              sync.Mutex
 	messageRateLimit      int
@@ -304,7 +327,8 @@ func (c *Connection) SendMessage(msg *acpb.MessageBody) error {
 			// Start with 250ms sleep, then simply multiply by iteration.
 			timeSleep(time.Duration(i*250) * time.Millisecond)
 			continue
-		} else if errors.Is(err, ErrMessageTimeout) {
+		}
+		if errors.Is(err, ErrMessageTimeout) {
 			continue
 		}
 		return err
@@ -554,19 +578,25 @@ func createStreamLoop(ctx context.Context, client *agentcommunication.Client, re
 
 func (c *Connection) createStream(ctx context.Context) error {
 	loggerPrintf("Creating stream.")
-	token, err := getIdentityToken()
-	if err != nil {
-		return fmt.Errorf("%w: %v", ErrGettingInstanceToken, err)
+
+	md := metadata.New(map[string]string{
+		"agent-communication-channel-id": c.channelID,
+	})
+
+	if c.usingVSOCK {
+		loggerPrintf("Using VSOCK for stream connection.")
+	} else {
+		token, err := getIdentityToken()
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrGettingInstanceToken, err)
+		}
+		md.Set("authentication", "Bearer "+token)
+		md.Set("agent-communication-resource-id", c.resourceID)
+		loggerPrintf("Using ResourceID %q", c.resourceID)
 	}
-
-	ctx = metadata.NewOutgoingContext(ctx, metadata.New(map[string]string{
-		"authentication":                  "Bearer " + token,
-		"agent-communication-resource-id": c.resourceID,
-		"agent-communication-channel-id":  c.channelID,
-	}))
-
-	loggerPrintf("Using ResourceID %q", c.resourceID)
 	loggerPrintf("Using ChannelID %q", c.channelID)
+
+	ctx = metadata.NewOutgoingContext(ctx, md)
 
 	// Set a timeout for the stream, this is well above service side timeout.
 	cnclCtx, cancel := context.WithTimeout(ctx, 60*time.Minute)
@@ -609,9 +639,7 @@ func (c *Connection) createStream(ctx context.Context) error {
 // the connection to be closed automatically. The passed in client will not be closed and can be
 // reused.
 func NewConnection(ctx context.Context, channelID string, client *agentcommunication.Client) (*Connection, error) {
-	if err := metadataInit(); err != nil {
-		return nil, err
-	}
+	usingVSOCK := clientUsingVSOCK(client)
 
 	conn := &Connection{
 		channelID:           channelID,
@@ -623,9 +651,17 @@ func NewConnection(ctx context.Context, channelID string, client *agentcommunica
 		timeToWaitForResp:   2 * time.Second,
 		client:              client,
 		callerManagedClient: true,
+		usingVSOCK:          usingVSOCK,
 	}
 
-	conn.resourceID = getResourceID()
+	// VSOCK connections do not require metadata initialization, resource ID is set by the proxy.
+	if !usingVSOCK {
+		if err := metadataInit(); err != nil {
+			return nil, err
+		}
+		conn.resourceID = getResourceID()
+	}
+
 	if err := conn.createStream(ctx); err != nil {
 		conn.close(err)
 		return nil, err
@@ -635,6 +671,7 @@ func NewConnection(ctx context.Context, channelID string, client *agentcommunica
 }
 
 // CreateConnection creates a new connection.
+// NOTE: CreateConnection does not support VSOCK connections.
 // DEPRECATED: Use NewConnection instead.
 func CreateConnection(ctx context.Context, channelID string, regional bool, opts ...option.ClientOption) (*Connection, error) {
 	if err := metadataInit(); err != nil {
@@ -649,6 +686,7 @@ func CreateConnection(ctx context.Context, channelID string, regional bool, opts
 		streamReady:       make(chan struct{}),
 		sends:             make(chan *acpb.StreamAgentMessagesRequest),
 		timeToWaitForResp: 2 * time.Second,
+		usingVSOCK:        false,
 	}
 
 	var err error

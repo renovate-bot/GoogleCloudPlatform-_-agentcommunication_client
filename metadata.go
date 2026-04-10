@@ -36,30 +36,6 @@ const (
 var (
 	metadataInited bool
 	metadataInitMx sync.RWMutex
-	metadataInit   = func() error {
-		metadataInitMx.Lock()
-		defer metadataInitMx.Unlock()
-		if metadataInited {
-			return nil
-		}
-
-		metadataInitData, err := MetadataInitFunc()
-		if err != nil {
-			loggerPrintf("Failed to initialize metadata: %v", err)
-			return err
-		}
-		if metadataInitData == nil {
-			return errors.New("metadata init data is nil")
-		}
-
-		protectedZone = metadataInitData.Zone
-		protectedResourceID = metadataInitData.ResourceID
-		protectedIDToken = &cachedIDToken{tokenGetter: metadataInitData.TokenGetter}
-		protectedUniverseDomain = metadataInitData.UniverseDomain
-
-		metadataInited = true
-		return nil
-	}
 	// MetadataInitFunc is a function that initializes the metadata. If not set, the metadata will be
 	// initialized for GCE.
 	MetadataInitFunc func() (*MetadataInitData, error) = initGCEMetadata
@@ -69,6 +45,32 @@ var (
 	protectedUniverseDomain string
 	protectedIDToken        = &cachedIDToken{}
 )
+
+func metadataInit() error {
+	metadataInitMx.Lock()
+	defer metadataInitMx.Unlock()
+
+	if metadataInited {
+		return nil
+	}
+
+	metadataInitData, err := MetadataInitFunc()
+	if err != nil {
+		loggerPrintf("Failed to initialize metadata: %v", err)
+		return err
+	}
+	if metadataInitData == nil {
+		return errors.New("metadata init data is nil")
+	}
+
+	protectedZone = metadataInitData.Zone
+	protectedResourceID = metadataInitData.ResourceID
+	protectedIDToken = &cachedIDToken{tokenGetter: metadataInitData.TokenGetter}
+	protectedUniverseDomain = metadataInitData.UniverseDomain
+
+	metadataInited = true
+	return nil
+}
 
 // MetadataInitData contains the data needed to initialize the metadata. This is returned by the
 // MetadataInitFunc.
