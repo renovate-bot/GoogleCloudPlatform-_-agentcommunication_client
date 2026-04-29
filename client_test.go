@@ -97,18 +97,17 @@ func TestMain(m *testing.M) {
 type testSrv struct {
 	sync.Mutex
 
-	req        []*acpb.StreamAgentMessagesRequest
-	reqMx      sync.Mutex
-	headers    metadata.MD
-	send       chan *acpb.StreamAgentMessagesResponse
-	recvErr    chan error
-	grpcServer *grpc.Server
+	req           []*acpb.StreamAgentMessagesRequest
+	reqMx         sync.Mutex
+	headers       metadata.MD
+	send          chan *acpb.StreamAgentMessagesResponse
+	recvErr       chan error
+	persistentErr error
 }
 
-func newTestSrv(grpcServer *grpc.Server) *testSrv {
+func newTestSrv(*grpc.Server) *testSrv {
 	return &testSrv{
-		recvErr:    make(chan error, 1),
-		grpcServer: grpcServer,
+		recvErr: make(chan error, 10),
 	}
 }
 
@@ -144,6 +143,14 @@ func (s *testSrv) StreamAgentMessages(stream acpb.AgentCommunication_StreamAgent
 					return
 				}
 				s.recvErr <- err
+				return
+			}
+
+			s.reqMx.Lock()
+			pErr := s.persistentErr
+			s.reqMx.Unlock()
+			if pErr != nil {
+				s.recvErr <- pErr
 				return
 			}
 			s.reqMx.Lock()
@@ -475,6 +482,10 @@ func TestNewConnection(t *testing.T) {
 }
 
 func TestNewConnectionErrors(t *testing.T) {
+	metadataInitMx.Lock()
+	metadataInited = false
+	metadataInitMx.Unlock()
+
 	tests := []struct {
 		name        string
 		err         error
@@ -638,12 +649,9 @@ func TestNewConnection_ExceededRetries(t *testing.T) {
 				t.Fatalf("createTestSrv() failed: %v", err)
 			}
 
-			// Push 4 errors (initial + 2 retries + 1 that should fail).
-			go func() {
-				for i := 0; i < 4; i++ {
-					srv.recvErr <- status.Error(tc.code, tc.name)
-				}
-			}()
+			srv.reqMx.Lock()
+			srv.persistentErr = status.Error(tc.code, tc.name)
+			srv.reqMx.Unlock()
 
 			client, err := NewClient(ctx, false, option.WithGRPCConn(cc))
 			if err != nil {
@@ -660,6 +668,7 @@ func TestNewConnection_ExceededRetries(t *testing.T) {
 		})
 	}
 }
+
 func TestSendMessage(t *testing.T) {
 	ctx := context.Background()
 	srv, conn, err := newTestConnection(ctx, t)
@@ -671,7 +680,7 @@ func TestSendMessage(t *testing.T) {
 	if err := conn.SendMessage(msg); err != nil {
 		t.Fatalf("SendMessage() failed: %v", err)
 	}
-	time.Sleep(5 * time.Millisecond)
+	waitForRequests(t, srv, 2)
 
 	if len(srv.req) != 2 {
 		t.Fatalf("srv.req = %v, want 2", len(srv.req))
@@ -695,7 +704,7 @@ func TestSendMessage_VSOCK(t *testing.T) {
 	if err := conn.SendMessage(msg); err != nil {
 		t.Fatalf("SendMessage() failed: %v", err)
 	}
-	time.Sleep(5 * time.Millisecond)
+	waitForRequests(t, srv, 2)
 
 	if len(srv.req) != 2 {
 		t.Fatalf("srv.req = %v, want 2", len(srv.req))
@@ -755,18 +764,19 @@ func TestSendMessage_ClosedConnection(t *testing.T) {
 
 			// Lock the recv loop.
 			srv.send <- &acpb.StreamAgentMessagesResponse{Type: &acpb.StreamAgentMessagesResponse_MessageBody{}}
-			time.Sleep(5 * time.Millisecond)
+			waitForRequests(t, srv, 2)
 			// Close the connection server side, client should not autoreconnect because it is blocked on recv.
 			srv.recvErr <- tc.err
 
 			// Should wait for reconnect.
 			msg := &acpb.MessageBody{Labels: map[string]string{"key": "value"}, Body: &apb.Any{Value: []byte("test-body")}}
 			sendErr := make(chan error)
+			started := make(chan struct{})
 			go func() {
+				close(started)
 				sendErr <- conn.SendMessage(msg)
 			}()
-			// Give goroutine enough time to start
-			time.Sleep(5 * time.Millisecond)
+			<-started
 
 			// Should only have 2 messages, register and the ack.
 			srv.reqMx.Lock()
@@ -889,8 +899,7 @@ func TestClose(t *testing.T) {
 
 	// Closing server stream, connection should auto reconnect.
 	srv.recvErr <- nil
-	// Wait for closed.
-	time.Sleep(5 * time.Millisecond)
+	waitForRequests(t, srv, 2)
 	err = conn.SendMessage(&acpb.MessageBody{Labels: map[string]string{"key": "value"}, Body: &apb.Any{Value: []byte("test-body")}})
 	if err != nil {
 		t.Fatalf("SendMessage() failed: %v", err)
@@ -939,5 +948,27 @@ func TestGetIdentityToken(t *testing.T) {
 	}
 	if token != rawToken {
 		t.Errorf("idToken.raw = %v, want %v", protectedIDToken.raw, rawToken)
+	}
+}
+
+func waitForRequests(t *testing.T, srv *testSrv, expectedCount int) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 1*time.Second)
+	defer cancel()
+
+	for {
+		srv.reqMx.Lock()
+		count := len(srv.req)
+		srv.reqMx.Unlock()
+
+		if count >= expectedCount {
+			return
+		}
+
+		select {
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for %d requests, got %d", expectedCount, count)
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 }
